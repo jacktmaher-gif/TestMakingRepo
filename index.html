@@ -32,6 +32,7 @@
   .value { font-size: 22px; font-weight: 700; font-variant-numeric: tabular-nums; }
   #nextCanvas { display: block; margin: 0 auto; }
   #stage { position: relative; }
+  canvas { -webkit-tap-highlight-color: transparent; outline: none; }
   canvas#game { display: block; border-radius: 14px; touch-action: none; cursor: pointer; }
   #overlay {
     position: absolute; inset: 0; display: none; flex-direction: column; align-items: center; justify-content: center;
@@ -217,6 +218,7 @@
   // ---------- Game state ----------
   let bodies, particles, popups, score, best, nextId;
   let heldTier, nextTier, aimX, cooldown, dangerTimer, over;
+  let heldAppear = 1, combo = 0, comboTimer = 0, shake = 0, aimVel = 0, lastAim = W / 2;
   try { best = +localStorage.getItem('cosmicMergeBest') || 0; } catch (e) { best = 0; }
 
   const randTier = () => Math.floor(Math.random() * SPAWN_MAX);
@@ -226,6 +228,7 @@
     score = 0; nextId = 1;
     heldTier = randTier(); nextTier = randTier();
     aimX = W / 2; cooldown = 0; dangerTimer = 0; over = false;
+    heldAppear = 1; combo = 0; comboTimer = 0; shake = 0;
     overlay.classList.remove('show');
     updateHud();
   }
@@ -244,7 +247,8 @@
   }
 
   function makeBody(x, y, tier, vx = 0, vy = 0) {
-    return { id: nextId++, x, y, vx, vy, r: TIERS[tier].r, tier, angle: 0, age: 0, dead: false, grow: 1 };
+    return { id: nextId++, x, y, vx, vy, r: TIERS[tier].r, tier, angle: 0, spin: 0, age: 0, dead: false, grow: 1,
+      sq: 0, sqv: 0, sqAng: Math.PI / 2 };
   }
 
   function clampAim(x, tier) {
@@ -255,10 +259,14 @@
   function drop() {
     if (over || cooldown > 0) return;
     const x = clampAim(aimX, heldTier);
-    bodies.push(makeBody(x, DROP_Y, heldTier, 0, 0));
+    // small throw from recent aim movement, plus a downward kick
+    const nb = makeBody(x, DROP_Y, heldTier, Math.max(-160, Math.min(160, aimVel * 0.25)), 250);
+    nb.sqv = -3; nb.sqAng = Math.PI / 2; // stretch as it falls
+    bodies.push(nb);
     heldTier = nextTier;
     nextTier = randTier();
     cooldown = DROP_COOLDOWN;
+    heldAppear = 0;
     updateHud();
   }
 
@@ -280,8 +288,14 @@
       const ox = b.x;
       b.x += b.vx * dt;
       b.y += b.vy * dt;
-      b.angle += (b.x - ox) / b.r;
-      if (b.grow < 1) { b.grow = Math.min(1, b.grow + dt * 6); }
+      // rolling: spin eases toward the rate that matches horizontal motion
+      b.spin += ((b.x - ox) / b.r / dt - b.spin) * Math.min(1, dt * 12);
+      b.angle += b.spin * dt;
+      if (b.grow < 1) { b.grow = Math.min(1, b.grow + dt * 5); }
+      // squash & stretch spring
+      b.sqv += (-280 * b.sq - 14 * b.sqv) * dt;
+      b.sq += b.sqv * dt;
+      b.sq = Math.max(-0.28, Math.min(0.28, b.sq));
     }
 
     const merges = [];
@@ -311,7 +325,13 @@
         const rvx = b.vx - a.vx, rvy = b.vy - a.vy;
         const vn = rvx * nx + rvy * ny;
         if (vn < 0) {
-          const e = 0.15;
+          const e = vn < -250 ? 0.38 : 0.08; // lively on hard hits, calm when resting
+          if (vn < -200) {
+            const k = Math.min(0.25, -vn / 2500) * 30;
+            const ang = Math.atan2(ny, nx);
+            if (-vn > Math.abs(a.sqv) * 60) { a.sqAng = ang; a.sqv = Math.abs(a.sqv) + k * (mb / mt) * 2; }
+            if (-vn > Math.abs(b.sqv) * 60) { b.sqAng = ang; b.sqv = Math.abs(b.sqv) + k * (ma / mt) * 2; }
+          }
           const jn = -(1 + e) * vn / (1 / ma + 1 / mb);
           a.vx -= jn * nx / ma; a.vy -= jn * ny / ma;
           b.vx += jn * nx / mb; b.vy += jn * ny / mb;
@@ -331,23 +351,42 @@
       if (b.x + b.r > W - WALL) { b.x = W - WALL - b.r; if (b.vx > 0) b.vx *= -0.2; b.vy *= 0.995; }
       if (b.y + b.r > H - WALL) {
         b.y = H - WALL - b.r;
-        if (b.vy > 0) b.vy *= -0.15;
-        b.vx *= 0.985;
+        if (b.vy > 0) {
+          if (b.vy > 250) { b.sqAng = Math.PI / 2; b.sqv = Math.abs(b.sqv) + Math.min(7, b.vy / 120); }
+          b.vy *= b.vy > 300 ? -0.4 : -0.1;
+        }
+        b.vx *= 0.99;
       }
     }
 
     for (const [a, b] of merges) {
       const x = (a.x + b.x) / 2, y = (a.y + b.y) / 2;
-      score += points(a.tier);
-      popups.push({ x, y, text: '+' + points(a.tier), life: 0.9 });
+      combo = comboTimer > 0 ? combo + 1 : 1;
+      comboTimer = 0.9;
+      const gained = points(a.tier) * Math.min(combo, 5);
+      score += gained;
+      popups.push({ x, y, text: '+' + gained, life: 0.9 });
+      if (combo >= 2) popups.push({ x, y: y - 24, text: 'Combo x' + Math.min(combo, 5), life: 1.1, big: true });
       spawnParticles(x, y, a.tier);
+      shake = Math.min(14, shake + 1.5 + a.tier * 1.1);
+      // shockwave: nudge neighbours outward
+      const reach = TIERS[Math.min(a.tier + 1, TIERS.length - 1)].r * 2.4;
+      const power = 160 + a.tier * 45;
+      for (const o of bodies) {
+        if (o.dead) continue;
+        const dx = o.x - x, dy = o.y - y, d = Math.hypot(dx, dy) || 1;
+        if (d > reach) continue;
+        const f = power * (1 - d / reach) * (TIERS[0].r / o.r) ** 0.5;
+        o.vx += dx / d * f; o.vy += dy / d * f - f * 0.4;
+      }
       if (a.tier < TIERS.length - 1) {
-        const nb = makeBody(x, y, a.tier + 1, (a.vx + b.vx) / 2, (a.vy + b.vy) / 2);
-        nb.grow = 0.5; nb.age = 1;
+        const nb = makeBody(x, y, a.tier + 1, (a.vx + b.vx) / 2, (a.vy + b.vy) / 2 - 120);
+        nb.grow = 0.4; nb.age = 1; nb.sqv = 5; nb.sqAng = 0;
         bodies.push(nb);
       } else {
         score += 100; // two suns: supernova bonus
-        popups.push({ x, y: y - 30, text: 'SUPERNOVA! +100', life: 1.6 });
+        shake = 20;
+        popups.push({ x, y: y - 30, text: 'SUPERNOVA! +100', life: 1.6, big: true });
       }
     }
     if (merges.length) { bodies = bodies.filter(b => !b.dead); updateHud(); }
@@ -356,6 +395,11 @@
   function update(dt) {
     if (over) { tickEffects(dt); return; }
     cooldown = Math.max(0, cooldown - dt);
+    if (cooldown === 0) heldAppear = Math.min(1, heldAppear + dt * 6);
+    comboTimer = Math.max(0, comboTimer - dt);
+    shake *= Math.pow(0.002, dt);
+    aimVel = (aimX - lastAim) / Math.max(dt, 1e-3) * 0.5 + aimVel * 0.5;
+    lastAim = aimX;
     const sdt = dt / SUBSTEPS;
     for (let i = 0; i < SUBSTEPS; i++) step(sdt);
     for (const b of bodies) {
@@ -391,7 +435,11 @@
   let time = 0;
 
   function render() {
+    const sx = shake > 0.3 ? (Math.random() - 0.5) * shake : 0;
+    const sy = shake > 0.3 ? (Math.random() - 0.5) * shake : 0;
     ctx.setTransform(scale * dpr, 0, 0, scale * dpr, 0, 0);
+    ctx.fillStyle = '#0d1028'; ctx.fillRect(0, 0, W, H);
+    ctx.setTransform(scale * dpr, 0, 0, scale * dpr, sx * scale * dpr, sy * scale * dpr);
     // background
     const bg = ctx.createLinearGradient(0, 0, 0, H);
     bg.addColorStop(0, '#1a1f45'); bg.addColorStop(1, '#0d1028');
@@ -417,14 +465,25 @@
     // aim guide + held body
     if (!over) {
       const hx = clampAim(aimX, heldTier);
-      ctx.strokeStyle = 'rgba(255,255,255,0.15)'; ctx.lineWidth = 2;
-      ctx.beginPath(); ctx.moveTo(hx, DROP_Y); ctx.lineTo(hx, H - WALL); ctx.stroke();
-      drawBody(ctx, hx, DROP_Y, TIERS[heldTier].r, heldTier, 0, cooldown > 0 ? 0.35 : 1);
+      if (heldAppear > 0) {
+        ctx.strokeStyle = `rgba(255,255,255,${0.15 * heldAppear})`; ctx.lineWidth = 2;
+        ctx.beginPath(); ctx.moveTo(hx, DROP_Y); ctx.lineTo(hx, H - WALL); ctx.stroke();
+        const s = easeOutBack(heldAppear);
+        drawBody(ctx, hx, DROP_Y, TIERS[heldTier].r * Math.max(0.01, s), heldTier, 0, heldAppear);
+      }
     }
 
     for (const b of bodies) {
       const r = b.r * (b.grow < 1 ? 0.6 + 0.4 * easeOutBack(b.grow) : 1);
-      drawBody(ctx, b.x, b.y, r, b.tier, b.angle);
+      if (Math.abs(b.sq) > 0.005) {
+        // squash along the impact direction, stretch across it (area roughly preserved)
+        ctx.save();
+        ctx.translate(b.x, b.y); ctx.rotate(b.sqAng); ctx.scale(1 - b.sq, 1 + b.sq); ctx.rotate(-b.sqAng);
+        drawBody(ctx, 0, 0, r, b.tier, b.angle);
+        ctx.restore();
+      } else {
+        drawBody(ctx, b.x, b.y, r, b.tier, b.angle);
+      }
     }
 
     for (const p of particles) {
@@ -434,8 +493,9 @@
     }
     ctx.globalAlpha = 1;
 
-    ctx.font = 'bold 18px system-ui, sans-serif'; ctx.textAlign = 'center';
+    ctx.textAlign = 'center';
     for (const p of popups) {
+      ctx.font = (p.big ? 'bold 22px' : 'bold 18px') + ' system-ui, sans-serif';
       ctx.globalAlpha = Math.min(1, p.life * 2);
       ctx.fillStyle = '#ffe58a';
       ctx.fillText(p.text, p.x, p.y);
@@ -461,7 +521,8 @@
     return (e.clientX - rect.left) / scale;
   }
   canvas.addEventListener('pointermove', e => { aimX = toLocal(e); });
-  canvas.addEventListener('pointerdown', e => { aimX = toLocal(e); });
+  canvas.addEventListener('pointerdown', e => { e.preventDefault(); aimX = toLocal(e); });
+  canvas.addEventListener('contextmenu', e => e.preventDefault());
   canvas.addEventListener('pointerup', e => { aimX = toLocal(e); drop(); });
   const keys = {};
   window.addEventListener('keydown', e => {
